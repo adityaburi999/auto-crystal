@@ -85,9 +85,20 @@ public class HumanPatternCalculator {
     private static final float ROT_SPEED_FINE_MIN = 10f;
     private static final float ROT_SPEED_FINE_RANGE = 10f;  // 10–20°/tick
 
-    // ── Burst anti-repeat ────────────────────────────────────────────────────
-    /** If true, burst was active last cycle – suppress another burst immediately. */
-    private boolean lastCycleWasBurst = false;
+    // ── Burst cooldown ────────────────────────────────────────────────────────
+    /**
+     * Number of remaining cycles during which a burst is blocked.
+     * Randomised to 2–4 after each burst to avoid an alternating pattern.
+     */
+    private int burstCooldownCycles = 0;
+
+    // ── Rotation speed zone (hysteresis) ─────────────────────────────────────
+    /**
+     * Last rotation-speed zone (1 = far, 2 = mid, 3 = fine).
+     * Retained between ticks so that the zone only switches when the angular
+     * distance has moved well past the boundary, eliminating rapid oscillation.
+     */
+    private int rotSpeedZone = 0; // 0 = unset
 
     // ── State ─────────────────────────────────────────────────────────────────
     private final Random           rng;
@@ -137,17 +148,20 @@ public class HumanPatternCalculator {
      * Returns {@code true} if the next action is in a "burst" window, causing
      * the caller to compress its timing slightly.
      *
-     * <p>Consecutive bursts are suppressed to avoid an unnaturally machine-like
-     * rhythm that anticheat heuristics can fingerprint.
+     * <p>After each burst a randomised cooldown of 2–4 non-burst cycles is
+     * enforced, preventing the alternating on/off pattern that Boolean
+     * suppression would produce.
      */
     public boolean isBurstActive() {
-        if (lastCycleWasBurst) {
-            lastCycleWasBurst = false;
+        if (burstCooldownCycles > 0) {
+            burstCooldownCycles--;
             return false;
         }
-        boolean burst = rng.nextDouble() < 0.15;
-        lastCycleWasBurst = burst;
-        return burst;
+        if (rng.nextDouble() < 0.15) {
+            burstCooldownCycles = 2 + rng.nextInt(3); // 2–4 cycles
+            return true;
+        }
+        return false;
     }
 
     /**
@@ -173,23 +187,42 @@ public class HumanPatternCalculator {
      * Returns the maximum rotation speed (degrees per tick) appropriate for
      * the given angular distance to the target.
      *
+     * <p>Zones with hysteresis (± 3°) prevent rapid speed oscillation when
+     * the angular distance hovers near a boundary:
      * <ul>
-     *   <li>&gt; 45° – coarse tracking (30–45°/tick)
-     *   <li>10–45° – moderate precision (20–35°/tick)
-     *   <li>&lt; 10° – fine correction (10–20°/tick)
+     *   <li>&gt; 45° (or &gt; 42° while already in mid/fine) – coarse (30–45°/tick)
+     *   <li>10–45° (or 7–47° while already in mid) – moderate (20–35°/tick)
+     *   <li>&lt; 10° (or &lt; 13° while already in fine) – fine (10–20°/tick)
      * </ul>
      *
      * @param angularDist total angular distance remaining (degrees)
      * @return maximum degrees to rotate this tick
      */
     public float getVariableRotationSpeed(float angularDist) {
-        if (angularDist > 45f) {
-            return ROT_SPEED_FAR_MIN  + ROT_SPEED_FAR_RANGE  * (float) rng.nextDouble();
-        } else if (angularDist > 10f) {
-            return ROT_SPEED_MID_MIN  + ROT_SPEED_MID_RANGE  * (float) rng.nextDouble();
-        } else {
-            return ROT_SPEED_FINE_MIN + ROT_SPEED_FINE_RANGE * (float) rng.nextDouble();
+        // Determine zone with ±3° hysteresis around each boundary.
+        if (rotSpeedZone != 1 && angularDist > 47f) {
+            rotSpeedZone = 1;
+        } else if (rotSpeedZone == 1 && angularDist < 42f) {
+            rotSpeedZone = 2;
+        } else if (rotSpeedZone != 3 && angularDist < 8f) {
+            rotSpeedZone = 3;
+        } else if (rotSpeedZone == 3 && angularDist > 13f) {
+            rotSpeedZone = 2;
+        } else if (rotSpeedZone == 0) {
+            // Initial assignment
+            rotSpeedZone = angularDist > 45f ? 1 : angularDist < 10f ? 3 : 2;
         }
+
+        return switch (rotSpeedZone) {
+            case 1  -> ROT_SPEED_FAR_MIN  + ROT_SPEED_FAR_RANGE  * (float) rng.nextDouble();
+            case 3  -> ROT_SPEED_FINE_MIN + ROT_SPEED_FINE_RANGE * (float) rng.nextDouble();
+            default -> ROT_SPEED_MID_MIN  + ROT_SPEED_MID_RANGE  * (float) rng.nextDouble();
+        };
+    }
+
+    /** Resets the rotation speed zone so the next call picks a fresh zone. */
+    public void resetRotationZone() {
+        rotSpeedZone = 0;
     }
 
     /**
