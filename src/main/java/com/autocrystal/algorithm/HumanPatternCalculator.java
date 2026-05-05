@@ -19,10 +19,15 @@ import java.util.Random;
  *       plays sharply, followed by 0.5–2 s "lapse windows" with looser timing.
  *   <li><b>Burst mode</b> – 15 % chance per cycle to enter a 2-action burst
  *       with compressed timing, simulating a skilled player's muscle memory.
+ *       Consecutive bursts are suppressed to avoid machine-like patterns.
  *   <li><b>Rotation noise</b> – tiny Gaussian offsets on yaw/pitch to replicate
  *       the micro-tremor present in even expert mouse movements.
  *   <li><b>Overshoot</b> – 8 % chance that the first rotation attempt overshoots
  *       by 3–8 °, followed by an immediate correction.
+ *   <li><b>Distraction pauses</b> – ~1.5 % chance per cycle of a 0.6–2.6 s
+ *       pause simulating momentary inattention or a missed input.
+ *   <li><b>Variable rotation speed</b> – coarse tracking uses 30–45 °/tick,
+ *       moderate 20–35 °/tick, fine correction 10–20 °/tick.
  * </ol>
  */
 public class HumanPatternCalculator {
@@ -60,7 +65,29 @@ public class HumanPatternCalculator {
 
     // ── Rotation noise ────────────────────────────────────────────────────────
     /** Std-dev of micro-tremor noise applied to final yaw/pitch (degrees). */
-    private static final double ROTATION_NOISE_SIGMA = 0.4;
+    private static final double ROTATION_NOISE_SIGMA = 0.35;
+
+    // ── Distraction ───────────────────────────────────────────────────────────
+    /** Probability per cycle of a brief distraction pause (missed input). */
+    private static final double DISTRACTION_PROBABILITY = 0.015;
+    /** Range of the distraction pause: 600 – 2 600 ms. */
+    private static final long   DISTRACTION_MIN_MS   = 600L;
+    private static final long   DISTRACTION_RANGE_MS = 2_000L;
+
+    // ── Variable rotation speed ───────────────────────────────────────────────
+    /** Max °/tick when far from target (coarse tracking). */
+    private static final float ROT_SPEED_FAR_MIN  = 30f;
+    private static final float ROT_SPEED_FAR_RANGE = 15f;   // 30–45°/tick
+    /** Max °/tick when moderately close to target. */
+    private static final float ROT_SPEED_MID_MIN  = 20f;
+    private static final float ROT_SPEED_MID_RANGE = 15f;   // 20–35°/tick
+    /** Max °/tick for fine-grained correction (< 10°). */
+    private static final float ROT_SPEED_FINE_MIN = 10f;
+    private static final float ROT_SPEED_FINE_RANGE = 10f;  // 10–20°/tick
+
+    // ── Burst anti-repeat ────────────────────────────────────────────────────
+    /** If true, burst was active last cycle – suppress another burst immediately. */
+    private boolean lastCycleWasBurst = false;
 
     // ── State ─────────────────────────────────────────────────────────────────
     private final Random           rng;
@@ -109,9 +136,60 @@ public class HumanPatternCalculator {
     /**
      * Returns {@code true} if the next action is in a "burst" window, causing
      * the caller to compress its timing slightly.
+     *
+     * <p>Consecutive bursts are suppressed to avoid an unnaturally machine-like
+     * rhythm that anticheat heuristics can fingerprint.
      */
     public boolean isBurstActive() {
-        return rng.nextDouble() < 0.15;
+        if (lastCycleWasBurst) {
+            lastCycleWasBurst = false;
+            return false;
+        }
+        boolean burst = rng.nextDouble() < 0.15;
+        lastCycleWasBurst = burst;
+        return burst;
+    }
+
+    /**
+     * Returns {@code true} if the module should skip this cycle entirely,
+     * simulating a brief moment of inattention or a missed input.
+     *
+     * <p>Fires with ~{@value #DISTRACTION_PROBABILITY} probability and should
+     * be checked once per cooldown/idle transition.
+     */
+    public boolean shouldSkipCycle() {
+        return rng.nextDouble() < DISTRACTION_PROBABILITY;
+    }
+
+    /**
+     * Returns a random distraction pause duration in milliseconds.
+     * Only meaningful when {@link #shouldSkipCycle()} returns {@code true}.
+     */
+    public long getDistractionPauseMs() {
+        return DISTRACTION_MIN_MS + (long)(DISTRACTION_RANGE_MS * rng.nextDouble());
+    }
+
+    /**
+     * Returns the maximum rotation speed (degrees per tick) appropriate for
+     * the given angular distance to the target.
+     *
+     * <ul>
+     *   <li>&gt; 45° – coarse tracking (30–45°/tick)
+     *   <li>10–45° – moderate precision (20–35°/tick)
+     *   <li>&lt; 10° – fine correction (10–20°/tick)
+     * </ul>
+     *
+     * @param angularDist total angular distance remaining (degrees)
+     * @return maximum degrees to rotate this tick
+     */
+    public float getVariableRotationSpeed(float angularDist) {
+        if (angularDist > 45f) {
+            return ROT_SPEED_FAR_MIN  + ROT_SPEED_FAR_RANGE  * (float) rng.nextDouble();
+        } else if (angularDist > 10f) {
+            return ROT_SPEED_MID_MIN  + ROT_SPEED_MID_RANGE  * (float) rng.nextDouble();
+        } else {
+            return ROT_SPEED_FINE_MIN + ROT_SPEED_FINE_RANGE * (float) rng.nextDouble();
+        }
     }
 
     /**

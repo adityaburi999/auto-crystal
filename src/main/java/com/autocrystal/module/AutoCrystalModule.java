@@ -50,10 +50,6 @@ public class AutoCrystalModule {
     private static final float  TARGET_RANGE     = 6.0f;
     private static final long   SPAWN_TIMEOUT_MS = 1_000L;
 
-    // ── Rotation smoothing ────────────────────────────────────────────────────
-    /** Maximum degrees the player can rotate in a single tick (20 ms). */
-    private static final float  MAX_ROT_PER_TICK = 40.0f;
-
     // ── State ─────────────────────────────────────────────────────────────────
     private boolean enabled = false;
     private CrystalState  state = CrystalState.IDLE;
@@ -196,9 +192,7 @@ public class AutoCrystalModule {
                 false
         );
 
-        // Swing arm first (visible to other players), then interact
-        client.player.networkHandler.sendPacket(
-                new HandSwingC2SPacket(Hand.MAIN_HAND));
+        // interactBlock internally triggers the arm-swing animation
         client.interactionManager.interactBlock(
                 client.player, Hand.MAIN_HAND, hitResult);
 
@@ -256,6 +250,10 @@ public class AutoCrystalModule {
             return;
         }
 
+        // Respect attack cooldown – most anticheats flag attacks sent before
+        // the cooldown completes (Grim, Vulcan, Matrix).
+        if (client.player.getAttackCooldownProgress(0.0f) < 0.9f) return;
+
         // Attack (left-click) the crystal
         client.interactionManager.attackEntity(client.player, pendingCrystal);
         client.player.networkHandler.sendPacket(
@@ -271,6 +269,12 @@ public class AutoCrystalModule {
         // If burst mode, shorten the next reaction time
         boolean burst = humanPattern.isBurstActive();
         long delay    = burst ? 20L : humanPattern.getReactionDelayMs(true);
+
+        // Occasionally simulate a distraction (missed input / brief inattention).
+        // This produces natural-looking gaps that confuse pattern-based detection.
+        if (humanPattern.shouldSkipCycle()) {
+            delay += humanPattern.getDistractionPauseMs();
+        }
 
         transitionTo(CrystalState.ACQUIRING_TARGET, delay);
     }
@@ -385,8 +389,9 @@ public class AutoCrystalModule {
     // ═════════════════════════════════════════════════════════════════════════
 
     /**
-     * Smoothly rotates the local player toward {@code target} by at most
-     * {@link #MAX_ROT_PER_TICK} degrees per tick.
+     * Smoothly rotates the local player toward {@code target} using a
+     * speed that varies with the remaining angular distance, making the
+     * movement harder to fingerprint with a fixed-rate pattern.
      *
      * <p>On the first call after a new target is set, there is an 8 % chance of
      * overshooting slightly (see {@link HumanPatternCalculator#getOvershootDegrees()}).
@@ -415,13 +420,14 @@ public class AutoCrystalModule {
         float dist = MathHelper.sqrt(dyaw * dyaw + dpitch * dpitch);
         if (dist < 2.0f) return true;
 
-        float step = Math.min(dist, MAX_ROT_PER_TICK) / dist;
+        float maxSpeed = humanPattern.getVariableRotationSpeed(dist);
+        float step = Math.min(dist, maxSpeed) / dist;
         float newYaw   = curYaw   + dyaw   * step;
         float newPitch = curPitch + dpitch * step;
         newPitch = MathHelper.clamp(newPitch, -90f, 90f);
 
-        // Overshoot simulation (only when we would arrive this tick)
-        if (!pendingOvershootCorrection && dist <= MAX_ROT_PER_TICK) {
+        // Overshoot simulation (only when we are within one speed-step of target)
+        if (!pendingOvershootCorrection && dist <= maxSpeed) {
             double overshoot = humanPattern.getOvershootDegrees();
             if (overshoot > 0) {
                 overshootYaw   = newYaw   + (float) overshoot;
