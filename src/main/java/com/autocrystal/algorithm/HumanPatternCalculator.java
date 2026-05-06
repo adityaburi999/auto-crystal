@@ -145,6 +145,53 @@ public class HumanPatternCalculator {
     }
 
     /**
+     * Returns the crystal-cycle interval adjusted for the current ramp phase.
+     *
+     * <p>Human players start a crystal session cautiously (slower), gain speed
+     * over the first ~15 cycles, then settle into their natural variable rhythm:
+     * <ul>
+     *   <li>Cycles 0–4  (slow start):  1.8× – 1.4× normal interval
+     *   <li>Cycles 5–14 (gaining speed): 1.4× – 1.0× normal interval
+     *   <li>Cycles 15+  (full speed): natural variable interval
+     * </ul>
+     *
+     * @param cycleCount number of completed cycles in the current trigger session
+     */
+    public long getRampedCycleIntervalMs(int cycleCount) {
+        long base = getCycleIntervalMs();
+        if (cycleCount < 5) {
+            // Slow start: linearly scale from 1.8× down to 1.4×
+            double factor = 1.8 - (cycleCount * 0.08);
+            return (long) (base * factor);
+        } else if (cycleCount < 15) {
+            // Gaining speed: linearly scale from 1.4× down to 1.0×
+            double factor = 1.4 - ((cycleCount - 5) * 0.04);
+            return (long) (base * Math.max(1.0, factor));
+        }
+        // Full-speed variable rhythm
+        return base;
+    }
+
+    /**
+     * Returns a reaction delay adjusted for the ramp phase.
+     *
+     * <p>Early in a session the player takes longer to react (less committed);
+     * after a few cycles they anticipate the next placement.
+     *
+     * @param cycleCount number of completed cycles in the current trigger session
+     */
+    public long getRampedReactionDelayMs(int cycleCount) {
+        // After 3 cycles the player is clearly anticipating
+        long base = getReactionDelayMs(cycleCount >= 3);
+        if (cycleCount < 5) {
+            // Phase 0: 20–40 % slower during slow-start phase
+            double factor = 1.40 - (cycleCount * 0.08); // 1.40, 1.32, 1.24, 1.16, 1.08
+            return (long) (base * factor);
+        }
+        return base;
+    }
+
+    /**
      * Returns {@code true} if the next action is in a "burst" window, causing
      * the caller to compress its timing slightly.
      *

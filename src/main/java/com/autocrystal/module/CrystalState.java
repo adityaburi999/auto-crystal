@@ -1,12 +1,13 @@
 package com.autocrystal.module;
 
 /**
- * State machine for a single auto-crystal cycle.
+ * State machine for a single manual-trigger crystal cycle.
+ *
+ * <p>The cycle is activated by holding right-click on obsidian/bedrock while the
+ * player already holds an End Crystal and an enemy is within range.
  *
  * <pre>
- *  IDLE ──► ACQUIRING_TARGET ──► SWITCHING_ITEM
- *                                       │
- *                               ROTATING_TO_PLACE
+ *  IDLE ──► ACQUIRING_TARGET ──► ROTATING_TO_PLACE
  *                                       │
  *                                   PLACING
  *                                       │
@@ -18,18 +19,17 @@ package com.autocrystal.module;
  *                                       │
  *                                  COOLDOWN
  *                                       │
- *                                    IDLE ◄──┘
+ *                              ACQUIRING_TARGET ◄──┘
  * </pre>
  *
- * If the module is disabled or the target is lost, any state transitions to IDLE.
+ * If the right-click trigger is released, the crystal is no longer held, or the
+ * target is lost, any state transitions back to IDLE.
  */
 public enum CrystalState {
-    /** No active target; nothing to do. */
+    /** Waiting for the manual right-click trigger on obsidian/bedrock. */
     IDLE,
     /** Finding the best target and best placement position. */
     ACQUIRING_TARGET,
-    /** Switching to End Crystal item in hotbar (with human-like delay). */
-    SWITCHING_ITEM,
     /** Rotating head toward the placement block face. */
     ROTATING_TO_PLACE,
     /** Waiting for the right-click timing window before placing. */
