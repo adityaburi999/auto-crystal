@@ -32,11 +32,13 @@ public class AutoCrystalClient implements ClientModInitializer {
 
         // Hook into the client tick to drive the module
         ClientTickEvents.END_CLIENT_TICK.register(client -> {
-            // Handle toggle key press
+            // Handle toggle key press – arms or disarms the right-click trigger mode.
             while (toggleKey.wasPressed()) {
                 MODULE.setEnabled(!MODULE.isEnabled());
                 if (client.player != null) {
-                    String state = MODULE.isEnabled() ? "§aEnabled" : "§cDisabled";
+                    String state = MODULE.isEnabled()
+                            ? "§aArmed – hold right-click on obsidian/bedrock to crystal"
+                            : "§cDisarmed";
                     client.player.sendMessage(
                             net.minecraft.text.Text.literal("[AutoCrystal] " + state), true);
                 }
@@ -48,7 +50,7 @@ public class AutoCrystalClient implements ClientModInitializer {
             }
         });
 
-        AutoCrystalMod.LOGGER.info("AutoCrystal client initialized. Toggle: X");
+        AutoCrystalMod.LOGGER.info("AutoCrystal client initialized. Toggle: X (then hold right-click on obsidian/bedrock)");
     }
 
     /** Exposes the module for access from mixins or tests. */

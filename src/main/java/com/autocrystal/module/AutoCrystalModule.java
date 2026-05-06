@@ -5,7 +5,6 @@ import com.autocrystal.algorithm.HumanPatternCalculator;
 import com.autocrystal.config.AutoCrystalConfig;
 import net.minecraft.block.Blocks;
 import net.minecraft.client.MinecraftClient;
-import net.minecraft.entity.Entity;
 import net.minecraft.entity.decoration.EndCrystalEntity;
 import net.minecraft.entity.player.PlayerEntity;
 import net.minecraft.item.Items;
@@ -23,24 +22,40 @@ import java.util.List;
 import java.util.Random;
 
 /**
- * Core auto-crystal module.
+ * Core manual-trigger auto-crystal module.
  *
- * <p>Drives a state machine ({@link CrystalState}) and delegates all
- * timing/behavioural decisions to {@link HumanPatternCalculator} so that
- * the resulting actions are indistinguishable from a skilled human player.
+ * <p>Activation: the player must <b>hold right-click</b> on an obsidian or bedrock block
+ * while already holding an End Crystal in their main hand and while at least one enemy
+ * player is within range. The module then automatically places and breaks crystals in a
+ * loop until the player releases right-click, moves the crosshair away from valid blocks,
+ * loses the enemy, or runs out of crystals.
+ *
+ * <p>The player is <b>never</b> force-switched to an End Crystal — manual hotbar
+ * management is required.
  *
  * <h3>Cycle overview</h3>
  * <ol>
- *   <li>Find the best target player within range.
- *   <li>Enumerate obsidian/bedrock blocks near the target and score each by
- *       (targetDamage − 0.5 × selfDamage).
- *   <li>Wait a human-like reaction delay, then switch to End Crystal item.
- *   <li>Smoothly rotate toward the placement block.
- *   <li>Place the crystal (right-click with human position jitter).
- *   <li>Wait for the entity to spawn, then rotate toward it.
- *   <li>Attack the crystal (left-click).
- *   <li>Brief cooldown, then restart.
+ *   <li>Right-click held on obsidian/bedrock + crystal in hand + enemy nearby → activate.
+ *   <li>Find the best target player and best crystal placement near that target.
+ *   <li>Smoothly rotate toward the placement block (with human-like variability).
+ *   <li>Place the crystal (right-click packet with position jitter).
+ *   <li>Wait for the crystal entity to spawn in the world.
+ *   <li>Check the target's damage-invulnerability tick; wait for it to expire.
+ *   <li>Rotate toward the crystal and attack it (left-click).
+ *   <li>Brief ramped cooldown, then repeat from step 2 while trigger remains active.
  * </ol>
+ *
+ * <h3>Human-pattern features</h3>
+ * <ul>
+ *   <li><b>Ramp-up</b>: the first 15 cycles are progressively faster, mirroring a
+ *       player warming up into a fight.
+ *   <li><b>Damage-tick analysis</b>: the break is deferred while the target still has
+ *       invulnerability frames ({@code hurtTime > 1}) so every hit lands for full damage.
+ *   <li><b>No auto-switch</b>: the player must keep an End Crystal in their main hand;
+ *       if they switch away the session halts immediately.
+ *   <li>All existing human-pattern behaviours (fatigue, focus cycles, overshoot,
+ *       distraction pauses, variable rotation speed) remain active.
+ * </ul>
  */
 public class AutoCrystalModule {
 
@@ -54,14 +69,24 @@ public class AutoCrystalModule {
     private boolean enabled = false;
     private CrystalState  state = CrystalState.IDLE;
 
-    private PlayerEntity    currentTarget;
-    private PlacementTarget currentPlacement;
+    private PlayerEntity     currentTarget;
+    private PlacementTarget  currentPlacement;
     private EndCrystalEntity pendingCrystal;
 
     /** Timestamp after which the next action may be performed (human delay). */
     private long actionReadyAtMs = 0L;
     /** Time at which we started waiting for a crystal to spawn. */
     private long spawnWaitStartMs = 0L;
+
+    // ── Manual-trigger state ──────────────────────────────────────────────────
+    /** {@code true} while the player holds right-click on obsidian/bedrock. */
+    private boolean triggerActive = false;
+
+    /**
+     * Number of completed cycles in the current trigger session.
+     * Used to drive the ramp-up speed curve; resets when the trigger is released.
+     */
+    private int cycleCount = 0;
 
     private final HumanPatternCalculator humanPattern;
     private final Random rng = new Random();
@@ -91,10 +116,19 @@ public class AutoCrystalModule {
 
         AutoCrystalConfig cfg = AutoCrystalConfig.getInstance();
 
+        // Evaluate right-click trigger: must hold right-click on obsidian/bedrock
+        // while holding a crystal in main hand and an enemy is nearby.
+        updateTriggerState(client, cfg);
+
+        // If the trigger is released mid-cycle, abort everything.
+        if (!triggerActive) {
+            if (state != CrystalState.IDLE) reset();
+            return;
+        }
+
         switch (state) {
             case IDLE               -> tickIdle(client, cfg);
             case ACQUIRING_TARGET   -> tickAcquiring(client, cfg);
-            case SWITCHING_ITEM     -> tickSwitching(client);
             case ROTATING_TO_PLACE  -> tickRotatingToPlace(client);
             case PLACING            -> tickPlacing(client, cfg);
             case WAITING_FOR_SPAWN  -> tickWaitingForSpawn(client);
@@ -102,6 +136,46 @@ public class AutoCrystalModule {
             case BREAKING           -> tickBreaking(client);
             case COOLDOWN           -> tickCooldown(client);
         }
+    }
+
+    // ── Trigger evaluation ────────────────────────────────────────────────────
+
+    /**
+     * Updates {@link #triggerActive} based on three gating conditions:
+     * <ol>
+     *   <li>The player is holding right-click (use/interact key is pressed).
+     *   <li>The player's main hand holds an End Crystal.
+     *   <li>The crosshair is aimed at an obsidian or bedrock block.
+     *   <li>At least one enemy player is within {@value TARGET_RANGE} blocks.
+     * </ol>
+     *
+     * <p>When the trigger transitions from active → inactive the ramp counter
+     * ({@link #cycleCount}) is reset so the next session starts fresh.
+     */
+    private void updateTriggerState(MinecraftClient client, AutoCrystalConfig cfg) {
+        boolean wasActive = triggerActive;
+        triggerActive = false;
+
+        if (!client.options.useKey.isPressed()) {
+            if (wasActive) cycleCount = 0;
+            return;
+        }
+
+        // Crystal must be in main hand (no auto-switch)
+        if (!isCrystalInMainHand(client)) {
+            if (wasActive) cycleCount = 0;
+            return;
+        }
+
+        // Crosshair must be on obsidian or bedrock
+        if (!(client.crosshairTarget instanceof BlockHitResult bhr)) return;
+        var block = client.world.getBlockState(bhr.getBlockPos()).getBlock();
+        if (block != Blocks.OBSIDIAN && block != Blocks.BEDROCK) return;
+
+        // An enemy player must be nearby
+        if (findBestTarget(client, cfg) == null) return;
+
+        triggerActive = true;
     }
 
     // ═════════════════════════════════════════════════════════════════════════
@@ -112,12 +186,19 @@ public class AutoCrystalModule {
         currentTarget    = null;
         currentPlacement = null;
         pendingCrystal   = null;
+        // Begin the first cycle with the unanticipated reaction delay.
         transitionTo(CrystalState.ACQUIRING_TARGET,
                 humanPattern.getReactionDelayMs(false));
     }
 
     private void tickAcquiring(MinecraftClient client, AutoCrystalConfig cfg) {
         if (!isReady()) return;
+
+        // Crystal must still be in main hand – player can cancel by switching away.
+        if (!isCrystalInMainHand(client)) {
+            transitionTo(CrystalState.IDLE, 200L);
+            return;
+        }
 
         currentTarget = findBestTarget(client, cfg);
         if (currentTarget == null) {
@@ -131,25 +212,9 @@ public class AutoCrystalModule {
             return;
         }
 
-        transitionTo(CrystalState.SWITCHING_ITEM,
-                humanPattern.getReactionDelayMs(true));
-    }
-
-    private void tickSwitching(MinecraftClient client) {
-        if (!isReady()) return;
-
-        // Find End Crystal in hotbar
-        int slot = findCrystalSlot(client);
-        if (slot == -1) {
-            transitionTo(CrystalState.IDLE, 500L);
-            return;
-        }
-
-        // Switch to that slot (human-like: feels instantaneous once decided)
-        client.player.getInventory().selectedSlot = slot;
-        humanPattern.recordAction();
-
-        transitionTo(CrystalState.ROTATING_TO_PLACE, 30L);
+        // Rotate toward placement with a ramp-aware reaction delay.
+        transitionTo(CrystalState.ROTATING_TO_PLACE,
+                humanPattern.getRampedReactionDelayMs(cycleCount));
     }
 
     private void tickRotatingToPlace(MinecraftClient client) {
@@ -238,7 +303,7 @@ public class AutoCrystalModule {
         if (pendingCrystal == null || pendingCrystal.isRemoved()) {
             // Crystal already gone (someone else broke it, or lag); still counts
             transitionTo(CrystalState.COOLDOWN,
-                    humanPattern.getCycleIntervalMs());
+                    humanPattern.getRampedCycleIntervalMs(cycleCount));
             return;
         }
 
@@ -254,28 +319,39 @@ public class AutoCrystalModule {
         // the cooldown completes (Grim, Vulcan, Matrix).
         if (client.player.getAttackCooldownProgress(0.0f) < 0.9f) return;
 
+        // Damage-tick analysis: defer the break while the target still has
+        // invulnerability frames so every hit lands for full damage.
+        if (currentTarget != null && !currentTarget.isRemoved()
+                && currentTarget.hurtTime > 1) {
+            return; // wait one more tick for invulnerability to expire
+        }
+
         // Attack (left-click) the crystal
         client.interactionManager.attackEntity(client.player, pendingCrystal);
         client.player.networkHandler.sendPacket(
                 new HandSwingC2SPacket(Hand.MAIN_HAND));
 
         humanPattern.recordAction();
-        transitionTo(CrystalState.COOLDOWN, humanPattern.getCycleIntervalMs());
+        transitionTo(CrystalState.COOLDOWN, humanPattern.getRampedCycleIntervalMs(cycleCount));
     }
 
     private void tickCooldown(MinecraftClient client) {
         if (!isReady()) return;
 
-        // If burst mode, shorten the next reaction time
+        // Increment ramp counter after each successful cycle.
+        cycleCount++;
+
+        // If burst mode, shorten the next reaction time.
         boolean burst = humanPattern.isBurstActive();
-        long delay    = burst ? 20L : humanPattern.getReactionDelayMs(true);
+        long delay    = burst ? 20L : humanPattern.getRampedCycleIntervalMs(cycleCount);
 
         // Occasionally simulate a distraction (missed input / brief inattention).
-        // This produces natural-looking gaps that confuse pattern-based detection.
         if (humanPattern.shouldSkipCycle()) {
             delay += humanPattern.getDistractionPauseMs();
         }
 
+        // Loop directly back to ACQUIRING_TARGET (not IDLE) so the session
+        // continues without needing to re-evaluate the trigger block.
         transitionTo(CrystalState.ACQUIRING_TARGET, delay);
     }
 
@@ -375,13 +451,12 @@ public class AutoCrystalModule {
                 .orElse(null);
     }
 
-    /** Returns the hotbar slot containing an End Crystal, or -1. */
-    private int findCrystalSlot(MinecraftClient client) {
-        var inventory = client.player.getInventory();
-        for (int i = 0; i < 9; i++) {
-            if (inventory.getStack(i).getItem() == Items.END_CRYSTAL) return i;
-        }
-        return -1;
+    /**
+     * Returns {@code true} if the player's main hand currently holds an End Crystal.
+     * The module never auto-switches; the player must manage their own hotbar.
+     */
+    private boolean isCrystalInMainHand(MinecraftClient client) {
+        return client.player.getMainHandStack().getItem() == Items.END_CRYSTAL;
     }
 
     // ═════════════════════════════════════════════════════════════════════════
@@ -470,6 +545,8 @@ public class AutoCrystalModule {
         currentPlacement = null;
         pendingCrystal   = null;
         actionReadyAtMs  = 0L;
+        triggerActive    = false;
+        cycleCount       = 0;
         pendingOvershootCorrection = false;
     }
 }
