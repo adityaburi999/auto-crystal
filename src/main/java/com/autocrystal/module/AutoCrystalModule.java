@@ -341,9 +341,11 @@ public class AutoCrystalModule {
         // Increment ramp counter after each successful cycle.
         cycleCount++;
 
-        // If burst mode, shorten the next reaction time.
+        // If burst mode, compress the interval but stay on the ramp curve.
         boolean burst = humanPattern.isBurstActive();
-        long delay    = burst ? 20L : humanPattern.getRampedCycleIntervalMs(cycleCount);
+        long delay    = burst
+                ? (long)(humanPattern.getRampedCycleIntervalMs(cycleCount) * 0.45)
+                : humanPattern.getRampedCycleIntervalMs(cycleCount);
 
         // Occasionally simulate a distraction (missed input / brief inattention).
         if (humanPattern.shouldSkipCycle()) {
